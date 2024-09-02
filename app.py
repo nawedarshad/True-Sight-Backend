@@ -34,14 +34,24 @@ def index():
     return render_template('index.html')
 
 @app.route('/upload', methods=['POST'])
-def upload_video():
-    if 'video' not in request.files:
-        return jsonify({'error': 'No video file provided'}), 400
+def upload_media():
+    if 'media' not in request.files:
+        return jsonify({'error': 'No media file provided'}), 400
 
-    video_file = request.files['video']
-    video_path = os.path.join('uploads', video_file.filename)
-    video_file.save(video_path)
+    media_file = request.files['media']
+    media_path = os.path.join('uploads', media_file.filename)
+    media_file.save(media_path)
 
+    file_extension = os.path.splitext(media_file.filename)[1].lower()
+
+    if file_extension in ['.mp4', '.avi', '.mov', '.mkv']:  # Video file types
+        return process_video(media_path)
+    elif file_extension in ['.jpg', '.jpeg', '.png', '.bmp']:  # Image file types
+        return process_image(media_path)
+    else:
+        return jsonify({'error': 'Unsupported file type'}), 400
+
+def process_video(video_path):
     # Open the video file
     cap = cv2.VideoCapture(video_path)
     deepfake_count = 0
@@ -57,48 +67,77 @@ def upload_video():
         if not ret:
             break
 
-        # Prepare the frame for the face detection model
-        blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
-        net.setInput(blob)
-        detections = net.forward()
+        deepfake_detected, confidence_score, histograms = detect_deepfake_in_frame(frame, THRESHOLD)
+        if deepfake_detected:
+            deepfake_count += 1
+            deepfake_frame = frame.copy()  # Save the frame where the deepfake is detected
 
-        for i in range(0, detections.shape[2]):
-            confidence = detections[0, 0, i, 2]
-            if confidence > 0.5:
-                box = detections[0, 0, i, 3:7] * np.array([frame.shape[1], frame.shape[0], frame.shape[1], frame.shape[0]])
-                (startX, startY, endX, endY) = box.astype("int")
-
-                # Extract the face region of interest (ROI)
-                face_roi = frame[startY:endY, startX:endX]
-
-                # Prepare the face ROI for deepfake detection
-                face_roi_resized = cv2.resize(face_roi, (256, 256))
-                face_roi_array = img_to_array(face_roi_resized)
-                face_roi_array = np.expand_dims(face_roi_array, axis=0)
-                face_roi_array = preprocess_input(face_roi_array)
-
-                # Perform deepfake detection on the face ROI
-                prediction = deepfake_model.predict(face_roi_array)
-                confidence_score = prediction[0][0]
-                confidence_scores.append(confidence_score)
-
-                # Collect histogram data for all 3 color channels
-                hist_b = cv2.calcHist([frame], [0], None, [256], [0, 256])
-                hist_g = cv2.calcHist([frame], [1], None, [256], [0, 256])
-                hist_r = cv2.calcHist([frame], [2], None, [256], [0, 256])
-                frame_histograms.append((hist_b.flatten(), hist_g.flatten(), hist_r.flatten()))
-
-                if confidence_score > THRESHOLD:
-                    deepfake_count += 1
-                    deepfake_frame = frame.copy()  # Save the frame where the deepfake is detected
-
-                    # Draw a red rectangle around the detected face
-                    cv2.rectangle(deepfake_frame, (startX, startY), (endX, endY), (0, 0, 255), 2)
+        confidence_scores.append(confidence_score)
+        frame_histograms.append(histograms)
 
         total_frames += 1
 
     cap.release()
 
+    return analyze_results(confidence_scores, frame_histograms, deepfake_frame)
+
+def process_image(image_path):
+    frame = cv2.imread(image_path)
+
+    THRESHOLD = 0.7  # Adjusted threshold
+
+    deepfake_detected, confidence_score, histograms = detect_deepfake_in_frame(frame, THRESHOLD)
+
+    confidence_scores = [confidence_score]
+    frame_histograms = [histograms]
+    deepfake_frame = frame if deepfake_detected else None
+
+    return analyze_results(confidence_scores, frame_histograms, deepfake_frame)
+
+def detect_deepfake_in_frame(frame, threshold):
+    # Prepare the frame for the face detection model
+    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
+    net.setInput(blob)
+    detections = net.forward()
+
+    deepfake_detected = False
+    confidence_score = 0
+    histograms = None
+
+    for i in range(0, detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > 0.5:
+            box = detections[0, 0, i, 3:7] * np.array([frame.shape[1], frame.shape[0], frame.shape[1], frame.shape[0]])
+            (startX, startY, endX, endY) = box.astype("int")
+
+            # Extract the face region of interest (ROI)
+            face_roi = frame[startY:endY, startX:endX]
+
+            # Prepare the face ROI for deepfake detection
+            face_roi_resized = cv2.resize(face_roi, (256, 256))
+            face_roi_array = img_to_array(face_roi_resized)
+            face_roi_array = np.expand_dims(face_roi_array, axis=0)
+            face_roi_array = preprocess_input(face_roi_array)
+
+            # Perform deepfake detection on the face ROI
+            prediction = deepfake_model.predict(face_roi_array)
+            confidence_score = prediction[0][0]
+
+            # Collect histogram data for all 3 color channels
+            hist_b = cv2.calcHist([frame], [0], None, [256], [0, 256])
+            hist_g = cv2.calcHist([frame], [1], None, [256], [0, 256])
+            hist_r = cv2.calcHist([frame], [2], None, [256], [0, 256])
+            histograms = (hist_b.flatten(), hist_g.flatten(), hist_r.flatten())
+
+            if confidence_score > threshold:
+                deepfake_detected = True
+
+                # Draw a red rectangle around the detected face
+                cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 0, 255), 2)
+
+    return deepfake_detected, confidence_score, histograms
+
+def analyze_results(confidence_scores, frame_histograms, deepfake_frame):
     # Analyze the distribution of confidence scores
     mean_confidence = np.mean(confidence_scores)
     variance_confidence = np.var(confidence_scores)
@@ -115,11 +154,10 @@ def upload_video():
     }
 
     # Redirect to the analysis dashboard
-    return redirect(url_for('dashboard', video_name=video_file.filename))
+    return redirect(url_for('dashboard'))
 
 @app.route('/dashboard')
 def dashboard():
-    video_name = request.args.get('video_name')
     analysis_data = session.get('analysis_data')  # Retrieve analysis data from the session
 
     if analysis_data is None:
@@ -147,7 +185,6 @@ def dashboard():
     ax[1].set_ylabel('Frequency')
     ax[1].legend()
 
-    # Convert plots to PNG image and embed it in HTML
     png_image = BytesIO()
     plt.savefig(png_image, format='png')
     png_image.seek(0)
